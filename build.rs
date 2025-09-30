@@ -1,8 +1,55 @@
 fn main() {
     linker_be_nice();
+    configure_wifi_env();
     println!("cargo:rustc-link-arg=-Tdefmt.x");
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
+}
+
+fn configure_wifi_env() {
+    use std::path::Path;
+
+    const SSID_KEY: &str = "ESP_WIFI_SSID";
+    const PASSWORD_KEY: &str = "ESP_WIFI_PASSWORD";
+
+    // Re-run the build script when credentials change.
+    println!("cargo:rerun-if-env-changed={SSID_KEY}");
+    println!("cargo:rerun-if-env-changed={PASSWORD_KEY}");
+    println!("cargo:rerun-if-changed=.env");
+
+    let mut ssid = std::env::var(SSID_KEY).ok();
+    let mut password = std::env::var(PASSWORD_KEY).ok();
+
+    if (ssid.is_none() || password.is_none()) && Path::new(".env").exists() {
+        match dotenvy::from_path_iter(".env") {
+            Ok(iter) => {
+                for entry in iter {
+                    let (key, value) = entry.expect("failed to parse entry in .env file");
+
+                    if ssid.is_none() && key == SSID_KEY {
+                        ssid = Some(value);
+                    } else if password.is_none() && key == PASSWORD_KEY {
+                        password = Some(value);
+                    }
+                }
+            }
+            Err(err) => {
+                panic!("failed to load Wi-Fi credentials from .env: {err}");
+            }
+        }
+    }
+
+    let (ssid, password) = match (ssid, password) {
+        (Some(ssid), Some(password)) => (ssid, password),
+        _ => {
+            panic!(
+                "Wi-Fi credentials missing. Set {SSID_KEY} and {PASSWORD_KEY} as environment variables or provide a .env file."
+            );
+        }
+    };
+
+    println!("cargo:rustc-env={SSID_KEY}={ssid}");
+    println!("cargo:rustc-env={PASSWORD_KEY}={password}");
 }
 
 fn linker_be_nice() {
