@@ -11,13 +11,14 @@ extern crate alloc;
 use alloc::string::String;
 
 use blocking_network_stack::{ipv4, Stack};
+use core::sync::atomic::{AtomicU8, Ordering};
 use defmt::info;
+use embassy_executor::Spawner;
+use embassy_time::{Duration as EmbassyDuration, Timer};
 use esp_hal::{
     clock::CpuClock,
     gpio::{Level, Output, OutputConfig},
-    main,
     rng::Rng,
-    time::{Duration, Instant},
     timer::timg::TimerGroup,
 };
 use esp_wifi::{
@@ -84,18 +85,61 @@ fn configure_client(controller: &mut WifiController<'_>) {
         .expect("failed to update Wi-Fi power save mode");
 }
 
-#[main]
-fn main() -> ! {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LedState {
+    Connecting,
+    Connected,
+}
+
+impl LedState {
+    const fn as_u8(self) -> u8 {
+        match self {
+            LedState::Connecting => 0,
+            LedState::Connected => 1,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => LedState::Connected,
+            _ => LedState::Connecting,
+        }
+    }
+}
+
+static LED_STATE: AtomicU8 = AtomicU8::new(LedState::Connecting as u8);
+
+#[embassy_executor::task]
+async fn led_blink_task(mut led: Output<'static>) {
+    loop {
+        let mode = LedState::from_u8(LED_STATE.load(Ordering::Relaxed));
+        let delay = match mode {
+            LedState::Connecting => EmbassyDuration::from_millis(200),
+            LedState::Connected => EmbassyDuration::from_millis(750),
+        };
+
+        led.toggle();
+        Timer::after(delay).await;
+    }
+}
+
+#[esp_hal_embassy::main]
+async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(size: 96 * 1024);
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    let mut led = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
-
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let mut wdt0 = timg0.wdt;
     wdt0.disable();
+    let embassy_timer = timg0.timer1;
+    esp_hal_embassy::init(embassy_timer);
+
+    let led = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
+    spawner
+        .spawn(led_blink_task(led))
+        .expect("failed to spawn LED task");
 
     let mut rng = Rng::new(peripherals.RNG);
     let random_seed = rng.random();
@@ -131,8 +175,8 @@ fn main() -> ! {
         .connect()
         .expect("failed to start Wi-Fi connection");
 
-    let mut led_timer = Instant::now();
     let mut ip_reported = false;
+    let mut led_state = LedState::Connecting;
 
     loop {
         stack.work();
@@ -151,22 +195,33 @@ fn main() -> ! {
                     }
                 }
 
-                if led_timer.elapsed() >= Duration::from_millis(750) {
-                    led.toggle();
-                    led_timer = Instant::now();
+                let desired_state = if ip_reported {
+                    LedState::Connected
+                } else {
+                    LedState::Connecting
+                };
+
+                if led_state != desired_state {
+                    LED_STATE.store(desired_state.as_u8(), Ordering::Relaxed);
+                    led_state = desired_state;
                 }
             }
             Ok(false) => {
                 ip_reported = false;
-
-                if led_timer.elapsed() >= Duration::from_millis(200) {
-                    led.toggle();
-                    led_timer = Instant::now();
+                if led_state != LedState::Connecting {
+                    LED_STATE.store(LedState::Connecting.as_u8(), Ordering::Relaxed);
+                    led_state = LedState::Connecting;
                 }
             }
             Err(err) => {
                 esp_println::println!("Wi-Fi status error: {:?}", err);
+                if led_state != LedState::Connecting {
+                    LED_STATE.store(LedState::Connecting.as_u8(), Ordering::Relaxed);
+                    led_state = LedState::Connecting;
+                }
             }
         }
+
+        Timer::after(EmbassyDuration::from_millis(10)).await;
     }
 }
